@@ -1,0 +1,299 @@
+---
+title: 'BCB420 A1: Data Selection & Processing'
+author: "Jack Stanley"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+## Data Overview
+The data set of interest is entitled "Analysis of the transcriptome and DNA methylome in response to acute and recurrent low glucose in human primary astrocytes (RNA-Seq)", and can be accessed on the GEO database here: [GSE166847](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE166847). Essentially, this data set contains gene expression levels in human astrocytes (a type of glial cell) as a result of recurrent treatments of low glucose (hypoglycemia). Hypoglycemia is a very frequent side effect of insulin treatment for diabetes. This data set is incredibly interesting since diabetes is such a common disease, and hopefully this analysis can shed some light on the brain's hypoglycemia sensing as a result of insulin treatment. This sort of analysis could be helpful in finding therapeutics that could limit potential side effects of insulin treatment for diabetics. Also note that this RNA-Seq data set has an accompanying methylome data set, but I will only be focusing on the RNA-Seq data for my analysis.
+
+For this data set, human astrocyte cells were treated with either one, three, or four rounds of low glucose (only 0.1mmol/L) for three hours at a time for each day of treatment. On the fourth day, RNA was collected from each sample and sequenced. The control samples did not receive any rounds of low glucose, and were were grown consistently with normal levels of 2.5mmol/L glucose. There are 5 replicates for each treatment. Here's an overview of the experiment:
+
+| Treatment Name     | Treatment Rounds | Treatment Order (mmol/L per day) | 
+| ------------- |:-------------:|:-------------:|
+| Control (CONT)      | 0 | 2.5->2.5->2.5->2.5 |
+| Hypoglycemia (HYPO)     | 1      | 2.5->2.5->2.5->0.1 |
+| Antecedent Hypoglycemia (AH)  | 3      | 0.1->0.1->0.1->2.5 |
+| Recurrent Hypoglycemia (RH)  | 4      | 0.1->0.1->0.1->0.1 |
+
+
+Reference paper: https://www.biorxiv.org/content/10.1101/2020.07.07.191262v1.full
+(*Note: this article is a pre-print*)
+
+## Loading and Cleaning Data
+*Packages used in report*
+```{r, results='hide', warning=FALSE, message=FALSE}
+# Install required packages if necessary
+if (! requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (! requireNamespace("Biobase", quietly = TRUE)) {
+  BiocManager::install("Biobase")
+}
+if (! requireNamespace("GEOquery", quietly = TRUE)) {
+  BiocManager::install("GEOquery")
+}
+if (! requireNamespace("edgeR", quietly = TRUE)) {
+  BiocManager::install("edgeR")
+}
+```
+
+Let's start by loading our data from the GEO database.
+```{r, warning=FALSE, message=FALSE}
+# Download supplementary file from GEO;
+# Will save file to current directory;
+# Will not download again if file already present in current directory
+if (! dir.exists("GSE166847")){
+  supp_file <- GEOquery::getGEOSuppFiles("GSE166847")
+  file_name <- rownames(supp_file)
+} else {
+  file_name <- paste("GSE166847/", list.files("GSE166847"), sep="")
+}
+
+# Put CSV file into dataframe and remove extraneous columns;
+# Re-name columns to make them more easily understood
+counts = read.csv(file_name[1], header=TRUE)
+counts <- counts[, -c(2:6)]
+colnames(counts)[1] <- "Gene"
+for (index in 2:21) {
+  colnames(counts)[index] <-substring(colnames(counts)[index], 10)
+}
+```
+
+First, we should see how many expression profiles we have.
+```{r}
+# Number of genes
+dim(counts)[1]
+```
+This number is quite high, indicating that we are certainly dealing with some duplicates, most likely due to alternative splicing or other artefacts of the sequencing process. I would like to keep the alternative splicing variants in here for now, because I think that could be very interesting to see which variants are overexpressed in certain conditions. I will definitely have to remove low expression genes though, as these are likely to be artefacts.
+
+Now let's can compute a few statistics to see the quality of our data set. Here are some summary statistics for each of our four treatments (one replicate for each treatment).
+```{r}
+# Antecedent Hypoglycemia
+summary(counts[2])
+
+# Control
+summary(counts[7])
+
+# Hypoglycemia
+summary(counts[12])
+
+# Recurrent Hypoglycemia
+summary(counts[17])
+```
+As we can see, there is a *large* number of genes without any expression in all of these treatments. I won't bother applying a log2 transformation here since the output of all these 0s would simply yield a `-Inf` for nearly every statistic. This indicates that the researchers who collected the data cast a very wide net in terms of genes that they studied. I will have to discard a lot of these before I perform my full analysis. Still, the means across all four treatments are fairly similar (but it's too early to speculate if this is meaningful).
+
+Let's look at box plots of all our treatments and replicates in order to view any outliers and draw more informed conclusions about the quality of our data.
+```{r, fig.align = 'center'}
+# Set box plot colours
+box_col <- c(rep("#EB585C",5),rep("#1DA1CD",5),rep("#68D286",5),rep("#FCD174",5))
+# Draw box plot of uncleaned data (will look rough)
+boxplot(log2(edgeR::cpm(counts[,2:21])), col=box_col, las=2, cex.axis=0.9, 
+        main="Box Plot of Uncleaned Expression Values", ylab="log2 CPM")
+```
+As we can see, we will certainly need to remove low expression genes, as the median for nearly all of these samples is 0 or close to it (represented here by `-Inf` thanks to the log2 transformation); once that has been accomplished and the data has been normalized, I will make another box plot to confirm that the quality of this data is reasonable.
+
+So, let's start to clean the data by removing low expression genes (genes with a total count less than n=5 across all replicates for a given treatment).
+```{r}
+# Get our counter per million and re-attach gene names
+counts_per_mil <- edgeR::cpm(counts[2:21])
+rownames(counts_per_mil) <- counts[,1]
+
+# Filter out genes with counts less than n=5 across the data set 
+filter <- rowSums(counts_per_mil>1) >= 5
+counts_filtered <- counts[filter,]
+
+# Check how many genes we have left
+dim(counts_filtered)[1]
+```
+This number seems much more manageable, however we probably do still have a few duplicates or extras due to splicing or ribosomal proteins. Let's re-check our summary statistics.
+```{r}
+# Antecedent Hypoglycemia
+summary(log2(edgeR::cpm(counts_filtered[2])))
+
+# Control
+summary(log2(edgeR::cpm(counts_filtered[7])))
+
+# Hypoglycemia
+summary(log2(edgeR::cpm(counts_filtered[12])))
+
+# Recurrent Hypoglycemia
+summary(log2(edgeR::cpm(counts_filtered[17])))
+```
+The lower quartiles are more sensible after cleaning low expression genes (the minimum and mean values reading `-Inf` are a consequence of applying a log2 transformation to 0s in our data; ignore it). Let's check out a box plot of our filtered values for more detailed information
+```{r, warning=FALSE, message=FALSE, fig.align = 'center'}
+# Box plot with low expression genes removed, coloured by sample treatment
+boxplot(log2(edgeR::cpm(counts_filtered[,2:21])), col=box_col, las=2, cex.axis=0.9, 
+        main="Box Plot of Cleaned Expression Values", ylab="log2 CPM")
+```
+This box plot looks quite good, with the medians lining up almost exactly from sample to sample. I will still normalize this data, but the normalized box plot is unlikely to look much better. Still, normalization will be useful for our analysis further down the road. 
+
+## HUGO Mapping
+Fortunately, the gene IDs in this data set are already in HUGO format, however I will still check to see how many matches I get, since some of these gene IDs may consist of splice variants or previously used HUGO symbols.
+```{r, warning=FALSE, message=FALSE}
+# Load biomaRt package
+library(biomaRt)
+
+# Load the "ensmbl" Mart and the Homo Sapiens database
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("hsapiens_gene_ensembl",mart=ensembl)
+
+# Get HGNC symbols and filter them through our current gene IDs
+counts_matched <- getBM(attributes = "hgnc_symbol",
+   filters = c("hgnc_symbol"),
+   values = counts_filtered$Gene,
+   mart = ensembl)
+
+# Find proportion of unmatched genes (in percent)
+cat((1-dim(counts_matched)[1]/dim(counts_filtered)[1])*100, "% unmatched", sep="")
+
+# Find proportion of Ribosomal Proteins in data set
+rp = counts_filtered[grep(counts_filtered$Gene,pattern = "^RP"),]
+cat((dim(rp)[1]/dim(counts_filtered)[1])*100, "% Ribosomal Protein", sep="")
+```
+As we can see, only 14% of our gene IDs were not already in the expected HUGO format. Unfortunately, there is no mechanism to match up old HUGO IDs or splice variants in R; thus, I will leave these genes as they are for now. They are still searchable in the HUGO database, but they may not be included in every R package. I will need to be aware of this when I carry out my expression analysis. Interestingly, nearly 8% of our gene IDs correspond to various ribosomal proteins, which HUGO cannot interpret; these proteins are probably not something we care about in our expression analysis, but I will keep them around just in case. So all in all, the number of unmatched and deprecated HUGO gene names is only ~6%.
+
+## Normalization
+Let's first inspect the distribution of our data pre-normalization.
+```{r, fig.align = 'center'}
+# Convert our expression counts into density values
+counts_density <- apply(log2(edgeR::cpm(counts_filtered[2:21])), 2, density)
+
+# Calculate reasonable range for normal plot to start and end
+xlim <- 0 
+ylim <- 0
+for (i in 1:length(counts_density)) {
+ xlim <- range(c(xlim, counts_density[[i]]$x))
+ ylim <- range(c(ylim, counts_density[[i]]$y))
+}
+
+# Collect line colours and line type
+density_cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+
+# Initialize plot boundaries and draw lines for all 20 samples
+plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n",
+     main="pre-Normalization Density Plot")
+for (i in 1:length(counts_density)){
+  lines(counts_density[[i]], col=density_cols[i], lty=ltys[i])
+}
+
+# Put legend onto plot
+legend("topright", colnames(counts_filtered)[2:21],
+       col=density_cols, lty=ltys, cex=0.65, merge=TRUE, bg="#E0E0E0")
+```
+As we can see, the data has a reasonably normal distribution, but there is a distinct secondary hump. The good thing is that all 20 samples are quite overlapping in their distributions. As with the box blot, I don't expect this distribution to change significantly after normalization, since there is already little variation between the samples.
+
+Now we can normalize our values. I will be using the Trimmed Mean of M-values (TMM) method used in the `edgeR` package for this process. This is based on reducing variance between samples and works on the hypothesis that most genes are not deferentially expressed. Since I want to be able to compare different samples and treatments, TMM is the optimal method.
+```{r}
+# Convert our filtered counts into matrix format
+filtered_matrix <- as.matrix(counts_filtered[,2:21])
+rownames(filtered_matrix) <- counts_filtered$Gene
+d_value <- edgeR::DGEList(counts=filtered_matrix, 
+                          group=c(rep("AH",5), rep("CONT",5), rep("HYPO",5), rep("RH",5)))
+
+d_value <- edgeR::calcNormFactors(d_value)
+counts_normalized <- edgeR::cpm(d_value)
+```
+
+Now let's see what this normalization procedure does to the distribution.
+```{r, fig.align = 'center'}
+par(mfrow=c(1,2))
+##== Normalized Plot ==##
+
+# Convert our expression counts into density values
+counts_density_2 <- apply(log2(counts_normalized), 2, density)
+
+# Initialize plot boundaries and draw lines for all 20 samples
+plot(counts_density_2[[1]], xlim=xlim, ylim=ylim, type="n",
+     main="Normalized Density Plot")
+for (i in 1:length(counts_density_2)){
+  lines(counts_density_2[[i]], col=density_cols[i], lty=ltys[i])
+}
+
+# Put legend onto plot
+legend("topright", colnames(counts_normalized),
+       col=density_cols, lty=ltys, cex=0.65, merge=TRUE, bg="#E0E0E0")
+
+##== pre-Normalized Plot ==##
+
+# Initialize plot boundaries and draw lines for all 20 samples
+plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n",
+     main="pre-Normalization Density Plot")
+for (i in 1:length(counts_density)){
+  lines(counts_density[[i]], col=density_cols[i], lty=ltys[i])
+}
+
+# Put legend onto plot
+legend("topright", colnames(counts_filtered)[2:21],
+       col=density_cols, lty=ltys, cex=0.65, merge=TRUE, bg="#E0E0E0")
+
+```
+As expected, the two density plots are incredibly similar, but the normalized density is just a tiny bit tighter than the pre-normalized density. Again, it's very hard to see, but there is a slight difference, especially on the left tail.
+
+Now let's look at the box plots side by side.
+```{r, warning=FALSE, message=FALSE, fig.align = 'center'}
+par(mfrow=c(1,2))
+# Normalized box plot
+boxplot(log2(counts_normalized), col=box_col, las=2, cex.axis=0.6, 
+        main="Normalized Expression", ylab="log2 CPM")
+
+# pre-Normalized box plot
+boxplot(log2(edgeR::cpm(counts_filtered[,2:21])), col=box_col, las=2, cex.axis=0.6, 
+        main="pre-Normalized Expression", ylab="log2 CPM")
+```
+Again, the difference between the two plots is almost imperceptible, but it is there. The medians in the normalized plot line up just a tiny bit better (this effect is easier to see in RStudio, clicking quickly between both plots). Even though there is only a small improvement, it may allow us to compare our data slightly better and draw slightly stronger conclusions down the road. So this is still quite a valuable step.
+
+Now we can make an MDS plot just to  ensure that it makes sense to compare these samples to each another. Ideally there would be little distance between samples from the same treatment.
+```{r, fig.align = 'center'}
+# MDS plot of normalized counts
+edgeR::plotMDS.DGEList(d_value, labels=colnames(counts_normalized),
+               col=c(rep("#EB585C",5),rep("#1DA1CD",5),rep("#68D286",5),rep("#FCD174",5)),
+               main="MDS Plot for Normalized Counts")
+```
+Although this plot seems a bit scattered, it actually shows that there is very little distance between all 20 samples. In each dimension, each sample is within 1 unit of the other, and the variation seems to be mostly between each treatment, as opposed to between each sample within a treatment (aside from AH, which seems to have clustered on both sides of the graph). This is what we'd expect, as the replicates within each treatment should have minimal variation and each replicate is independent of the other (the ID of each replicate should have no bearing on its association with another replicate). Ultimately, this lack of extreme variation is a good indication that we can accurately compare replicates against each other.
+
+And finally, let's make a BCV plot to view the dispersion of our data. This measurement is essentially how much our data deviates from the mean, and ideally we should not see large clusters of high variance data points.
+```{r, fig.align = 'center'}
+# Create our sample matrix of 5 replicates for 4 treatments
+treatments <- c(rep("AH", 5), rep("CONT", 5), rep("HYPO", 5), rep("RH", 5))
+sample_matrix <- model.matrix(~treatments+0)
+
+# Calculate dispersion and convert to a BCV plot
+dispersion <- edgeR::estimateDisp(d_value, sample_matrix)
+edgeR::plotBCV(dispersion, main="BCV Plot of Normalized Counts")
+```
+This BCV plot looks good; we can see a very obvious downward trajectory as the counts increase, indicating that our variation decreases at high levels of expression (which is what we'd expect). This sort of tight graph is what I would expect, since we are using astrocyte cells from the same cell line, and the replicates are independent of each other. Ideally, the only difference in the expression data should come from the varying treatment regimens. 
+
+With all these diagnostics looking quite good, I will now output my final normalized and cleaned counts as a CSV file, and I will save the dataframe as an RDS object for easy recall.
+```{r}
+# Save normalized counts as an R object
+saveRDS(counts_normalized, file="HYPO_normalized_counts.RDS")
+
+# Save normalized counts as a CSV file
+write.csv(counts_normalized, file="HYPO_normalized_counts.csv")
+```
+
+## Interpretation and Final Thoughts
+Overall, this data set did not require very much alteration in order to make it useable. After removing low expression genes, normalization lowered the variance ever so slightly. And, the genes were already labeled with HUGO gene identifiers. This appears to be a high quality data set, which should allow me to draw stronger conclusions later on.
+
+Regarding the HUGO gene identifiers, it was fortunate that my data set already used these standardized gene names, and there were no duplicated genes to be found (all expression values were unique), although there were a few genes that had multiple splice variants. The only IDs from this data set that could not be mapped were ribosomal proteins (which is expected), and IDs that were using an older version of HUGO nomenclature. Fortunately, this was a relatively small percentage of my data, taking up about 8% and 6% respectively. I will have to be aware of these inconsistent IDs moving forward.
+
+In terms of data set cleaning, 43179 expression values corresponded to low expression genes, and these were subsequently removed, leaving 13691 genes with reasonable levels of expression. The high original number likely corresponds to alternatively spliced genes, and there are likely a few left in our final normalized counts. I left these in because it could be interesting to see if there are certain gene variants that are upregulated in response to low glucose conditions. I will keep these in mind when I carry out future analysis, and I may need to combine them later.
+
+Replicates were treated as separate samples in this preparation, aside from the normalization procedure where the "groups" correspond to each treatment; I did clean up the labels a bit to make it more clear which treatment was which. As stated previously, the final expression counts totaled 13691 genes, which is very good coverage. Naturally, some genes will not be highly expressed in astrocytes, so some legitimate genes were left out, and there may be a small number of splice variants, but overall this is a good representation of astrocyte gene expression.  
+
+## References
+1. Paul G Weightman Potter, Sam Washer, Aaron R Jeffries, Janet E Holley, Nick J Gutowski, Emma Dempster, Craig Beall. Analysis of the transcriptome and DNA methylome in response to acute and recurrent low glucose in human primary astrocytes. bioRxiv 2020.07.07.191262; doi: https://doi.org/10.1101/2020.07.07.191262
+
+2. https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE166847
+
+3. BCB420 2021 Course Notes; by Ruth Isserlin
+
+4. [HUGO Gene Nomenclature Committee](https://www.genenames.org/)
