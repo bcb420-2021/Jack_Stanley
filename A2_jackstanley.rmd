@@ -1,0 +1,340 @@
+---
+title: 'BCB420 A2: Differential Gene expression and Preliminary ORA'
+author: "Jack Stanley"
+output:
+  html_document:
+    df_print: paged
+    fig_caption: yes
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+## Introduction
+For this analysis, the data set of interest is entitled "Analysis of the transcriptome and DNA methylome in response to acute and recurrent low glucose in human primary astrocytes (RNA-Seq)"^1^, and can be accessed on the GEO database here: [GSE166847](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE166847)^2^. This data set contains gene expression levels in human astrocytes (a type of glial cell) as a result of recurrent treatments of low glucose (hypoglycemia), which is a very frequent side effect of insulin treatment for diabetes. This is an RNA-Seq data set.
+
+Human astrocyte cells were treated with either one, three, or four rounds of low glucose (only 0.1mmol/L) for three hours at a time for each day of treatment. On the fourth day, RNA was collected from each sample and sequenced. The control samples did not receive any rounds of low glucose, and were were grown consistently with normal levels of 2.5mmol/L glucose. There are 5 replicates for each treatment. Here’s an overview of the experiment:
+
+| Treatment Name     | Treatment Rounds | Treatment Order (mmol/L per day) | 
+| ------------- |:-------------:|:-------------:|
+| Control (CONT)      | 0 | 2.5->2.5->2.5->2.5 |
+| Hypoglycemia (HYPO)     | 1      | 2.5->2.5->2.5->0.1 |
+| Antecedent Hypoglycemia (AH)  | 3      | 0.1->0.1->0.1->2.5 |
+| Recurrent Hypoglycemia (RH)  | 4      | 0.1->0.1->0.1->0.1 |
+
+Reference paper: https://www.biorxiv.org/content/10.1101/2020.07.07.191262v1.full
+(*Note: this article is a pre-print*)
+
+*Loading necessary packages and data; note that the data was saved as BOTH an RDS file and a CSV file. Since I will be working with R, it is easier to load the RDS file.*
+```{r, results='hide', warning=FALSE, message=FALSE}
+# Packages
+if (! requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (! requireNamespace("Biobase", quietly = TRUE)) {
+  BiocManager::install("Biobase")
+}
+if (! requireNamespace("edgeR", quietly = TRUE)) {
+  BiocManager::install("edgeR")
+}
+if (! requireNamespace("circlize", quietly = TRUE)) {
+  install.packages("circlize")
+}
+if (! requireNamespace("ComplexHeatmap", quietly = TRUE)) {
+  install.packages("ComplexHeatmap")
+}
+
+# Data
+normalized_counts <- readRDS("HYPO_normalized_counts.RDS")
+```
+
+The data was cleaned by removing low expression genes (genes with a total count of less than $n=5$ across all replicates for a given treatment), and the cleaned data was ultimately normalized using the Trimmed Means of M-values (TMM) technique. This normalization procedure allows us to reduce variance between samples so that we can compare treatments across different replicates. All in all, the original data did not change much, but the variance was reduced slightly, which is a good thing. Here's the distribution of our samples in the form of a box plot and a density distribution:
+```{r fig.align = 'center', warning=FALSE, message=FALSE, fig.cap="***Figure 1**: Box plot of normalized expression counts indicating similar medians and interquartile ranges across all treatments and replicates (Left). Density distribution of normalized expression counts, indicating a similar and mostly normal distribution of samples across all treatments and replicates (Right)*"}
+par(mfrow=c(1,2))
+
+##== Box Plot ==##
+# Set box plot colours
+box_col <- c(rep("#EB585C",5),rep("#1DA1CD",5),rep("#68D286",5),rep("#FCD174",5))
+# Draw box plot
+boxplot(log2(normalized_counts), col=box_col, las=2, cex.axis=0.6, 
+        main="Normalized Expression", ylab="log2 CPM")
+
+##== Density Distribution ==##
+# Convert our expression counts into density values
+counts_density <- apply(log2(edgeR::cpm(normalized_counts)), 2, density)
+
+# Calculate reasonable range for normal plot to start and end
+xlim <- 0 
+ylim <- 0
+for (i in 1:length(counts_density)) {
+ xlim <- range(c(xlim, counts_density[[i]]$x))
+ ylim <- range(c(ylim, counts_density[[i]]$y))
+}
+
+# Collect line colours and line type
+density_cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+
+# Initialize plot boundaries and draw lines for all 20 samples
+plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n",
+     main="Normalized Density Plot")
+for (i in 1:length(counts_density)){
+  lines(counts_density[[i]], col=density_cols[i], lty=ltys[i])
+}
+
+# Put legend onto plot
+legend("topright", colnames(normalized_counts),
+       col=density_cols, lty=ltys, cex=0.65, merge=TRUE, bg="#E0E0E0")
+```
+
+We can see from these summary plots that our data is very evenly distributed across treatments and replicates. The medians and interquartile ranges are almost exactly the same across all replicates and the distribution of the counts is reasonably normal with limited variability from replicate to replicate. This bodes quite well for identifying which specific genes are over-expressed in specific treatments. As another measure of comparability, let's look at an MDS plot of our replicates and treatments:
+```{r, fig.align = 'center', fig.cap="***Figure 2**: MDS plot of normalized expression counts, indicating low variability between samples across all treatments and replicates.*"}
+# Generate DGEList
+d_value <- edgeR::DGEList(counts=normalized_counts, 
+                          group=c(rep("AH",5), rep("CONT",5), rep("HYPO",5), rep("RH",5)))
+
+# Draw MDS Plot
+edgeR::plotMDS.DGEList(d_value, labels=colnames(normalized_counts),
+               col=c(rep("#EB585C",5),rep("#1DA1CD",5),rep("#68D286",5),rep("#FCD174",5)),
+               main="MDS Plot for Normalized Counts", xlim=c(-1,1), ylim=c(-1,1))
+```
+
+As we can see from the MDS plot, our replicates are very well clustered across ALL treatments, with a few slightly tighter clusters based on each treatment, which is to be expected. This indicates that our samples are able to compared accurately, as the variance (distance on this plot) between the samples is relatively low.
+
+## Differential Gene Expression
+First, we should calculate p-values for every gene in our expression data set. To do this, it's necessary to make a model such that the treatment type is the only explanatory variable. We are able to do this because each replicate is *very* similar for each treatment (See *Figure 2* for proof). This is expected, as each replicate is simply another run of the experiment with the exact same parameters. The `exactTest` function in `edgeR` is useful here. I will be fitting models separately for each treatment, and will compare them to each other at the end. In my case, it makes sense to treat each replicate more or less equally without passing it as a parameter into our model, since there is no correlation between replicate number across treatments. If these samples had come from different individuals for example, I would have to include that in my model.
+```{r, warning=FALSE}
+# Create a design matrix corresponding to our 3 treatments with the control as the reference
+treatments <- c(rep("AH", 5), rep("CONT", 5), rep("HYPO", 5), rep("RH", 5))
+treatment_matrix <- cbind(c(rep(1,20)), c(rep(1,5), rep(0,5), rep(1,10)))
+
+# Loop to collect all treatments together
+fit_list <- vector(mode="list", length=3)
+names(fit_list) <- c("AH", "HYPO", "RH")
+
+for (i in c(0,2,3)) {
+  # Calculate dispersion from our counts
+  d_value <- edgeR::DGEList(counts=normalized_counts[,c((i*5+1):(i*5+5), 6:10)], 
+                            group=treatments[c((i*5+1):(i*5+5), 6:10)])
+  dispersion <- edgeR::estimateDisp(d_value, treatment_matrix[c((i*5+1):(i*5+5), 6:10),])
+  
+  # Create the model using exactTest
+  fit <- edgeR::exactTest(dispersion)
+  
+  # Collect all treatments in a single list
+  if (i==0){index<-1}else{index<-i}
+  fit_list[[index]] <- fit
+}
+```
+
+With this model, we can now calculate p-values and adjusted p-values to determine how many genes were significantly expressed. The threshold for this analysis will be $p<0.05$, as this value was used in the paper that this data set came from, and is a widely used threshold in biology. The adjustment method used to correct for multiple hypothesis testing is the Benjamini-Hochberg method, as this technique is not too stringent but should provide good correction.
+```{r}
+p_list <- fit_list
+# Extract p-values print the number of significant genes
+for (i in 1:3) {
+  p_table <- p_list[[i]]$table
+  p_list[[i]] <- p_table
+  
+  # Display number of genes that are significantly differentially expressed
+  cat(length(which(p_list[[i]]$PValue < 0.05)), " significant differentially expressed genes", 
+  " in treatment ", names(p_list)[i], ".\n", sep="")
+}
+
+# Apply correction for multiple hypothesis testing; re-name rows with gene names
+p_adj_list <- vector(mode="list", length=3)
+names(p_adj_list) <- c("AH", "HYPO", "RH")
+for (i in 1:3) {
+  p_adj <- p.adjust(p_list[[i]]$PValue, "BH")
+  p_adj <- as.matrix(p_adj)
+  rownames(p_adj) <- rownames(p_list[[i]]$PValue)
+  p_adj_list[[i]] <- p_adj
+  
+  # Display number of genes that are significantly differentially expressed after correction
+  cat(length(which(p_adj_list[[i]] < 0.05)), " significant differentially expressed genes", 
+  " in treatment ", names(p_adj_list)[i], " (after correction)", ".\n", sep="")
+}
+```
+Overall, this is a pretty good number of significant genes. It does seem that correcting for multiple hypothesis testing dramatically limits the number of significant hits we get. Thus, for my further analysis I will have to use the unadjusted p-values. Notably, it is clear that the HYPO treatment produced by far the largest number of significantly expressed genes, and this is also seen in the original paper for this data. More on that later.
+
+In order to view significant hits that *also* have a large fold change in expression, we can use a volcano plot, with log fold change on one axis and the negative log of the p-value on the other.
+```{r, fig.align='center', fig.cap="***Figure 3**: Volcano plots all three treatment variables, contrasting negative log p-value with log fold change. Significantly overexpressed genes are coloured red and significantly underexpressed genes are coloured blue.*"}
+par(mfrow=c(1,3), xpd=TRUE)
+# AH volcano plot
+plot(p_list$AH$logFC, -log10(p_list$AH$PValue), main="AH Genes of Interest",
+     ylab="-log(p-value)", xlab="log(FC)", ylim=c(0,8),
+     col=ifelse(p_list$AH$PValue<0.05 & p_list$AH$logFC>0, "red", 
+                ifelse(p_list$AH$PValue<0.05 & p_list$AH$logFC<0, "blue", "black")))
+legend("top", legend=c("Sig. Overexpressed", "Sig. Underexpressed"), col=c("red", "blue"), pch=1)
+
+# HYPO volcano plot
+plot(p_list$HYPO$logFC, -log10(p_list$HYPO$PValue), main="HYPO Genes of Interest",
+     ylab="-log(p-value)", xlab="log(FC)", ylim=c(0,8),
+     col=ifelse(p_list$HYPO$PValue<0.05 & p_list$HYPO$logFC>0, "red", 
+                ifelse(p_list$HYPO$PValue<0.05 & p_list$HYPO$logFC<0, "blue", "black")))
+legend("top", legend=c("Sig. Overexpressed", "Sig. Underexpressed"), col=c("red", "blue"), pch=1)
+
+# RH volcano plot
+plot(p_list$RH$logFC, -log10(p_list$RH$PValue), main="RH Genes of Interest",
+     ylab="-log(p-value)", xlab="log(FC)", ylim=c(0,8),
+     col=ifelse(p_list$RH$PValue<0.05 & p_list$RH$logFC>0, "red", 
+                ifelse(p_list$RH$PValue<0.05 & p_list$RH$logFC<0, "blue", "black")))
+legend("top", legend=c("Sig. Overexpressed", "Sig. Underexpressed"), col=c("red", "blue"), pch=1)
+```
+
+After adjusting the y-axis to compare across treatments, it is clear that the HYPO treatment has by far the largest number of significant hits. Interestingly, there appear to be more underexpressed significant hits in the HYPO treatment, whereas the other treatments have roughly equal number of overexpressed and underexpressed genes. Also note that there is in fact a very underexpressed outlier with a very low p-value (~40 -log(p-value)) in the HYPO treatment that I decided to leave of this graph to make it easier to read. I'll keep an eye on this outlier as we carry on.
+
+Now, we can  make a heatmap to better visualize the clustering of our different conditions according to certain top hits. Note that for this heatmap I will combining significant hits from *all* treatments to draw a more effective contrast and hopefully visualize some interesting clusters.
+```{r, warning=FALSE, message=FALSE, fig.align='center', fig.cap='***Figure 4**: Heatmap of relative expression of significant differentially expressed genes for all treatments. Blue indicates down-regulation, while red indicates up-regulation of genes. Distinct low glucose (HYPO) and recurrent low glucose (RH) can be seen.*'}
+# Load library and scale expression counts around a mean of 0.
+library(ComplexHeatmap)
+heatmap_matrix <- t(scale(t(normalized_counts)))
+
+# Select top hits with a p-value less than 0.05
+top_hitsAH <- rownames(p_list$AH)[p_list$AH$PValue<0.05]
+top_hitsHYPO <- rownames(p_list$HYPO)[p_list$HYPO$PValue<0.05]
+top_hitsRH <- rownames(p_list$RH)[p_list$RH$PValue<0.05]
+
+# Select the top hits from the scaled counts
+heatmap_combined_hits <- t(scale(t(heatmap_matrix[which(rownames(heatmap_matrix) %in% top_hitsHYPO | rownames(heatmap_matrix) %in% top_hitsAH | rownames(heatmap_matrix) %in% top_hitsRH),])))
+
+# Set heat map colours; blue is down-regulated, red is up-regulated
+if (min(heatmap_combined_hits)==0) {
+  heatmap_col <- circlize::colorRamp2(c(0, max(heatmap_combined_hits)), c("white","red"))
+} else {
+  heatmap_col <- circlize::colorRamp2(c(min(heatmap_combined_hits), 0, max(heatmap_combined_hits)),
+                                      c("blue", "white", "red"))
+}
+
+# Set heatmap parameters and draw heatmap
+current_heatmap <- Heatmap(as.matrix(heatmap_combined_hits), cluster_rows=TRUE,
+                           cluster_columns=TRUE,
+                           show_row_dend=TRUE,
+                           show_column_dend=TRUE,
+                           col=heatmap_col,
+                           show_column_names=TRUE,
+                           show_row_names=FALSE,
+                           show_heatmap_legend=TRUE,
+                           name="Expression")
+current_heatmap
+```
+
+From this heatmap, we can see that there is distinct clustering between the HYPO treatments and to a lesser extent the RH treatments. It certainly seems that there are more RH and HYPO on one side, and more CONT and AH on the other. Again, this is similar to what is seen in the original paper, but more on that later. Overall, this heatmap shows that there is a fairly large difference in which genes are up-regulated and down-regulated in the CONT samples vs those found in the HYPO samples. There are a few "out of place" columns, such as CONT_5 and AH_2, which if we recall were clustered more closely with HYPO and RH samples in the MDS plot as well (Figure 2), so this is not terribly surprising.
+
+## Threshold Over-Representation Analysis
+Now that the significant differentially expressed genes have been identified and analyzed, we can run a threshold over-representation analysis to see if there is really a difference in the types of genes that we see enriched for different treatments. For this analysis, I will be using [g:Profiler](https://biit.cs.ut.ee/gprofiler/gost)^3^ to identify particular genesets that are over-represented in my data. I chose g:Profiler because it fairly easy to use, and I already have some familiarity with it; it is easy to produce a simple text file of genes that pass the threshold and upload it to g:Profiler for the analysis. As well,  g:Profiler is fairly up to date, which is always a good thing to keep in mind when searching for functional groupings. It also hadnles plain text very well and can deal with HUGO gene IDs.
+
+In order to upload my top hits to g:Profiler, I first need to create a text file of all my genes that pass the threshold ($p<0.05$). I will be creating three separate text files for each treatment and will run them separately in g:Profiler. I will also be creating a ranked list (text file) That I will be using in the next assignment.
+```{r, warning=FALSE, message=FALSE}
+# For loop for each treatment
+threshold_list <- p_list
+for (i in 1:3) {
+  # Create a ranked column for signal strength and order the hits by their rank
+  threshold_list[[i]]$Rank <- -log10(threshold_list[[i]]$PValue) * sign(threshold_list[[i]]$logFC)
+  threshold_list[[i]] <- threshold_list[[i]][order(threshold_list[[i]]$Rank),]
+  
+  # Select gene names that pass threshold AND are up/downregulated
+  upregulated <- rownames(threshold_list[[i]])[which(threshold_list[[i]]$PValue<0.05
+                                                     &threshold_list[[i]]$logFC>0)]
+  downregulated <- rownames(threshold_list[[i]])[which(threshold_list[[i]]$PValue<0.05
+                                                     &threshold_list[[i]]$logFC<0)]
+  all_genes <- rownames(threshold_list[[i]])[which(threshold_list[[i]]$PValue<0.05)]
+  
+  # Create file names
+  file_name_up <- paste(names(threshold_list)[i], "_upregulated_genes.txt", sep="")
+  file_name_down <- paste(names(threshold_list)[i], "_downregulated_genes.txt", sep="")
+  file_name_all <- paste(names(threshold_list)[i], "_all_genes.txt", sep="")
+  file_name_rank <- paste(names(threshold_list)[i], "_ranked_genes.txt", sep="")
+  
+  # Create directories
+  dir.create("data")
+  
+  # Save up/downregulated lists of gene names as text files
+  write.table(upregulated, 
+              file=file.path("data", file_name_up),
+              sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+  write.table(downregulated, 
+              file=file.path("data", file_name_down),
+              sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+  write.table(all_genes, 
+              file=file.path("data", file_name_all),
+              sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+  
+  # Save ranked list of gene names as a text file (to be used later)
+  write.table(data.frame(rownames(threshold_list[[i]]), F_stat=threshold_list[[i]]$Rank), 
+              file=file.path("data", file_name_rank),
+              sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+}
+```
+
+In g:Profiler, I again selected a threshold of 0.05 using Benjamini-Hochberg correction, and I chose to look at the "GO biological process" annotations. I used these annotations because they give a more detailed overview of gene functional clusters. It seemed that some annotation sources like WikiPathways and KEGG were more suited to looking for disease characteristics, since they gave me a lot irrelevant results like COVID-19 and Salmonella infection. The GO annotations were quite up to date, last being updated on 2020-12-08 (according to g:Profiler). The results for each treatment are given below; note that I first ran upregulated and downregulated separately, and then ran combined lists.
+
+#### Low Glucose (HYPO) 
+For this treatment, the upregulated genes returned 15 different genesets from GO, the downregulated genes returned 129 genesets from GO, and a combined query returned 234 genesets from GO. All were above a threshold of 0.05. Note that I did not include every annotation in the figures below for the sake of readability. It may be necessary to zoom in to the figures to read each geneset.
+<center>
+
+![***Figure 5**: **A.** GO biological process annotation hits for significant upregulated genes, ordered by adjusted p-value. **B.** GO biological process annotation hits for significant downregulated genes. **C.** GO biological process annotation hits for all significant genes. All corresponding to low glucose (HYPO) treatment.*](figs/HYPO.png)
+
+</center>
+Interestingly, it seems that there are fewer hits for upregulated genes compared to downregulated genes; it also appears that combining the lists allowed for slightly lower adjusted p-values compared to running a single up/downregulated list. We can see from the downregulated results (Figure 5B) that there is quite a lot to do with protein translocation and translation, with the top hits relating to protein targeting to the endoplasmic reticulum (ER) There is also a large amount of results relating to mRNA processing. We can see from the upregulated genesets that there a few that relate to the ER, but mainly there are annotations that deal with stress response and apoptosis.
+
+#### Recurrent Low Glucose (RH)
+For this treatment, the upregulated genes returned 0 genesets from GO, the downregulated genes returned 45 genesets from GO, and a combined query returned 24 genesets from GO. All were above a threshold of 0.05.
+<center>
+
+![***Figure 6**: **A.** GO biological process annotation hits for significant downregulated genes, ordered by adjusted p-value. **B.** GO biological process annotation hits for all significant genes. All corresponding to  recurrent low glucose (RH) treatment. Note that there were 0 hits for upregulated genes.*](figs/RH.png)
+
+</center>
+The RH treatment presents a more extreme case, where there are actually no upregulated genesets corresponding to our significant hits. Although, this time running the combined list actually resulted in slightly higher adjusted p-values. Similarly to the HYPO treatment we do see some annotations dealing with the endoplasmic reticulum and translation, but we also start to see some downregulation of components in the cell cycle. I'll touch on this in my Interpretation section. Combining our lists did not seem to help here, most likely because the upregulated genes didn't really have any significantly over-represented features.
+
+#### Antecedent Low Glucose (AH)
+For this treatment, the upregulated genes returned 66 genesets from GO, the downregulated genes returned 4 genesets from GO, and a combined query returned 58 genesets from GO. All were above a threshold of 0.05.
+<center>
+
+![***Figure 7**: **A.** GO biological process annotation hits for significant upregulated genes, ordered by adjusted p-value. **B.** GO biological process annotation hits for significant downregulated genes. **C.** GO biological process annotation hits for all significant genes. All corresponding to antecedent low glucose (AH) treatment.*](figs/AH.png)
+
+</center>
+Finally, for the AH treatment, we actually see a reverse of the previous two treatments. This time, the upregulated genes correspond to more functional groups compared to the downregulated genes. Here, we now see upregulation of endoplasmic reticulum targeting groups and translational factors, whereas before we saw downregulation of these same factors. This is an interesting change that I will touch on in the upcoming interpretation section. There was little change when combining both lists, with the combined adjust p-values perhaps being slightly lower. Overall, I wouldn't say that combining the lists was very beneficial for any of the three treatments. It makes more sense to keep them separate so that they can be compared, in my view.
+
+## Interpretation
+#### Treatment Clustering
+The first thing to touch on is the potential reasons for similar results across different treatment regimes. Looking at the heatmap (Figure 4), we can see that the low glucose (HYPO) and recurrent low glucose (RH) treatments cluster together. When analyzing the treatments more closely it makes sense why this is the case; the recurrent low glucose cells endured bouts of glucose all four days including the final sample collection day, while the low glucose cells endured a single bout of low glucose on the collection day. In contrast, the antecedent low glucose endured bouts of low glucose for the first three days, not the collection day, and the control naturally never received any bouts of low glucose. Thus, it seems that on a surface level, it seems that having that bout of low glucose on the final collection day produces fairly characteristic results; the antecedent low glucose cells were allowed to "recover" and more closely resembled the control cells. This can also be seen quite clearly in the over-representation data (Figures 5, 6, and 7). The low glucose and and recurrent low glucose downregulated top hits seemed to correspond with more functional groupings compared to the upregulated top hits, while the reverse was true for the antecedent low glucose. In fact, the groupings that were downregulated in the low glucose and recurrent low glucose runs were mostly upregulated in the antecedent low glucose runs.
+
+These findings corroborate the results from the original paper, where the researchers saw strong clustering between low glucose and recurrent low glucose. As well, they state that similar pathways are implicated in both of these treatments.
+
+#### Over-Representation
+Digging into the over-representation analysis a bit more (Figures 5, 6, and 7), it seems that there is an obvious trend where the low glucose and recurrent low glucose treatments have a significant number of endoplasmic reticulum targeting and translation genesets that are downregulated. As well, the low glucose treatment sees and upregulation of genesets that are involved in apoptosis and stress response, as well as unfolded protein response. We see a reverse of this in the antecedent low glucose response, with upregulation of endoplasmic reticulum associate factors and translation factors.
+
+A possible mechanism to explain these findings is that acute bouts of low glucose can be damaging to the endoplasmic reticulum, which is strongly associated with translation and protein synthesis and localization^3^. Sensing a lack of glucose in the environment, the cell then decreases ER targeting and ramps down translation to compensate, and ramps up stress response signalling and in some cases prepares for apoptosis. The cell also upregulates genes involved in the unfolded protein response (UPR), which is an essential response to stress on the ER; this response is involved in cell fate decisions and helps to prevent potentially deadly over-production of incorrect or misfolded proteins when the ER is facing stress (like in the case of low glucose)^4^. A potential reason why the recurrent low glucose upregulated genes do not have significant functional association could be because the cell has become accustomed to bouts of low glucose, and already has stress response and UPR factors available from previous bouts. Finally, the antecedent low glucose samples reverse this expression paradigm because they undergo a day of recovery from bouts of low glucose. The cells can safely ramp up ER targeting and protein synthesis, as they have access to normal levels of glucose. It would be interesting to test these antecedent cells a few days after the last bout of low glucose, since we may see a downregulation of stress and URP response genes. It might be too early to see this downregulation after only a single day.
+
+The results of the original paper support this conclusion as well, although the authors focused more closely on analysis of a few specific genes. They found significant upregulation of URP-associate genes HSPA5, XBP1, and MANF in the low glucose treatment, but this upregulation was less evident in the recurrent low glucose samples. They draw very similar conclusions from this data as well, namely that acute low glucose causes immediate activation of genes involved in the UPR and the ER stress response, and that recurrent bouts of low glucose do not consistently trigger these genes. This supports the assertion that there is a certain "always on" component when the cell undergoes frequent periods of low glucose. The researchers did not touch on the the antecendent low glucose results in detail, so my own hypothesis remains uncorroborated.
+
+#### Discrepencies
+Unfortunately, there were a few discrepancies between my results and the results of the original paper. Although the overall conclusions were the same, they did manage to get 24 hits after correction, compared to my 18 hits. Although that doesn't seem like a lot, that is 1/3 more hits. The most likely explanation for this difference is that they used a different method for normalizing, assigning p-values, and correcting those p-values. They used the package `DESeq2` instead of `edgeR`, which has been known to produce different results from time to time, depending on the data set^6^. My view is that their method was a bit less stringent than mine, as some of their corrected top hits were almost above the threshold when I ran the analysis, but not quite.
+
+Overall, this analysis was quite informative and paints an interesting picture of ER-focused stress response as a result of low glucose. Seeing the differences between recurrent low glucose and acute low glucose was interesting as it implies an "always on" stress response, whereas the antecedent low glucose reveals a pattern of recovery.
+
+
+## References
+1. Paul G Weightman Potter, Sam Washer, Aaron R Jeffries, Janet E Holley, Nick J Gutowski, Emma Dempster, Craig Beall. Analysis of the transcriptome and DNA methylome in response to acute and recurrent low glucose in human primary astrocytes. bioRxiv 2020.07.07.191262; doi: https://doi.org/10.1101/2020.07.07.191262
+
+2. https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE166847
+
+3. Uku Raudvere, Liis Kolberg, Ivan Kuzmin, Tambet Arak, Priit Adler, Hedi Peterson, Jaak Vilo: g:Profiler: a web server for functional enrichment analysis and conversions of gene lists (2019 update) Nucleic Acids Research 2019; doi:10.1093/nar/gkz369
+
+4. A. Vitale, A. Ceriotti, J. Denecke, The Role of the Endoplasmic Reticulum in Protein Synthesis, Modification and Intracellular Transport, Journal of Experimental Botany, Volume 44, Issue 9, September 1993, Pages 1417–1444, https://doi.org/10.1093/jxb/44.9.1417
+
+5. Hetz, C. The unfolded protein response: controlling cell fate decisions under ER stress and beyond. Nat Rev Mol Cell Biol 13, 89–102 (2012). https://doi.org/10.1038/nrm3270
+
+6. https://www.biostars.org/p/168221/
+
+7. BCB420 2021 Course Notes; by Ruth Isserlin
+
+#### Package References
+*In order of appearance*
+
+1. McCarthy DJ, Chen Y, Smyth GK (2012). “Differential expression analysis of multifactor RNA-Seq experiments with respect to biological variation.” Nucleic Acids Research, 40(10), 4288-4297. doi: 10.1093/nar/gks042.
+
+2. Gu Z, Gu L, Eils R, Schlesner M, Brors B (2014). “circlize implements and enhances circular visualization in R.” Bioinformatics, 30, 2811-2812.
+
+3. Gu, Z. (2016) Complex heatmaps reveal patterns and correlations in multidimensional genomic data. DOI: 10.1093/bioinformatics/btw313
